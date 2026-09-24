@@ -1,0 +1,215 @@
+classDiagram
+    %% ===================================================================
+    %% PawPal+ -- UML class diagram
+    %%
+    %% Matches the implementation in pawpal_system.py.
+    %%
+    %% Reading order: Owner/Pet describe *who* the plan is for, CareTask
+    %% describes *what* could happen, Scheduler turns those into a single
+    %% household DailyPlan whose entries each carry a reason.
+    %% ===================================================================
+
+    %% ---------- People & pets ----------
+
+    class Owner {
+        +str name
+        +List~Pet~ pets
+        +OwnerPreferences preferences
+        +add_pet(pet: Pet) void
+        +get_pet(name: str) Pet
+        +all_tasks() List~CareTask~
+    }
+
+    class OwnerPreferences {
+        +time day_start
+        +time day_end
+        +int max_daily_minutes
+        +List~TimeWindow~ busy_windows
+        +int break_minutes
+        +available_minutes() int
+        +is_free(window: TimeWindow) bool
+    }
+
+    class Pet {
+        +str name
+        +str species
+        +str breed
+        +float age_years
+        +int energy_level
+        +List~str~ notes
+        +List~CareTask~ tasks
+        +add_task(task: CareTask) void
+        +remove_task(title: str) bool
+        +complete_task(title: str, on: date) CareTask
+        +tasks_due_on(day: date) List~CareTask~
+    }
+
+    %% ---------- Work to be scheduled ----------
+
+    class CareTask {
+        +str title
+        +int duration_minutes
+        +Priority priority
+        +TaskCategory category
+        +Recurrence recurrence
+        +time earliest_start
+        +time latest_finish
+        +bool is_required
+        +bool completed
+        +date anchor_date
+        +date completed_on
+        +mark_complete(on: date) CareTask
+        +next_instance() CareTask
+        +reset() void
+        +weight() float
+        +fits_in(window: TimeWindow) bool
+        +wanted_window() TimeWindow
+        +is_pinned() bool
+        +is_due_on(day: date) bool
+    }
+
+    class Priority {
+        <<enumeration>>
+        LOW
+        MEDIUM
+        HIGH
+        +score() int
+    }
+
+    class TaskCategory {
+        <<enumeration>>
+        FEEDING
+        EXERCISE
+        MEDICATION
+        GROOMING
+        ENRICHMENT
+        VET
+    }
+
+    class Recurrence {
+        <<enumeration>>
+        ONCE
+        DAILY
+        WEEKLY
+        +occurs_on(day: date, anchor: date) bool
+        +next_after(day: date) date
+    }
+
+    %% ---------- Time model ----------
+
+    class TimeWindow {
+        +time start
+        +time end
+        +duration_minutes() int
+        +overlaps(other: TimeWindow) bool
+        +contains(other: TimeWindow) bool
+        +shift(minutes: int) TimeWindow
+    }
+
+    %% ---------- Planning output ----------
+
+    class ScheduledTask {
+        +CareTask task
+        +Pet pet
+        +TimeWindow slot
+        +str reason
+        +label() str
+    }
+
+    class SkippedTask {
+        +CareTask task
+        +Pet pet
+        +str reason
+        +label() str
+    }
+
+    class ConflictWarning {
+        +TimeWindow wanted
+        +Pet first_pet
+        +CareTask first_task
+        +Pet second_pet
+        +CareTask second_task
+        +str outcome
+        +bool unresolvable
+        +involves(pet: Pet) bool
+        +label() str
+    }
+
+    class DailyPlan {
+        +date day
+        +Owner owner
+        +List~ScheduledTask~ scheduled
+        +List~SkippedTask~ skipped
+        +List~ConflictWarning~ conflicts
+        +str strategy_name
+        +pets() List~Pet~
+        +for_pet(pet: Pet) DailyPlan
+        +total_minutes() int
+        +is_double_booked() bool
+        +detect_conflicts() List~ConflictWarning~
+        -_requested_slots() List~Pet_CareTask_TimeWindow~
+        -_placement_of(task: CareTask) ScheduledTask
+        -_outcome_for(task: CareTask) str
+        +explain() str
+        +to_rows() List~dict~
+    }
+
+    %% ---------- Planning engine ----------
+
+    class Scheduler {
+        +OwnerPreferences preferences
+        +SchedulingStrategy strategy
+        +build_plan(owner: Owner, day: date) DailyPlan
+        +sort_by_time(items: List~ScheduledTask~) List~ScheduledTask~
+        -_candidates(owner: Owner, day: date) List~Pet_CareTask~
+        -_next_slot(task: CareTask, taken: List~TimeWindow~) TimeWindow
+        -_reason_for(task: CareTask, slot: TimeWindow) str
+    }
+
+    class SchedulingStrategy {
+        <<abstract>>
+        +str name
+        +order(tasks: List~CareTask~) List~CareTask~
+        +describe() str
+    }
+
+    class PriorityFirstStrategy {
+        +order(tasks: List~CareTask~) List~CareTask~
+        +describe() str
+    }
+
+    class QuickWinsStrategy {
+        +order(tasks: List~CareTask~) List~CareTask~
+        +describe() str
+    }
+
+    %% ---------- Relationships ----------
+
+    Owner "1" *-- "1" OwnerPreferences : configured by
+    Owner "1" *-- "0..*" Pet : cares for
+    Pet "1" *-- "0..*" CareTask : needs
+
+    CareTask --> Priority : ranked by
+    CareTask --> TaskCategory : typed as
+    CareTask --> Recurrence : repeats per
+
+    Scheduler "1" --> "1" OwnerPreferences : constrained by
+    Scheduler "1" o-- "1" SchedulingStrategy : ordered by
+    SchedulingStrategy <|-- PriorityFirstStrategy
+    SchedulingStrategy <|-- QuickWinsStrategy
+
+    Scheduler ..> Owner : reads
+    Scheduler ..> DailyPlan : creates
+    DailyPlan "1" --> "1" Owner : plans for
+    DailyPlan "1" *-- "0..*" ScheduledTask : contains
+    DailyPlan "1" *-- "0..*" SkippedTask : could not fit
+    DailyPlan "1" *-- "0..*" ConflictWarning : warns about
+    ScheduledTask "1" --> "1" CareTask : wraps
+    ScheduledTask "1" --> "1" Pet : belongs to
+    ScheduledTask "1" *-- "1" TimeWindow : occupies
+    SkippedTask "1" --> "1" CareTask : wraps
+    SkippedTask "1" --> "1" Pet : belongs to
+    ConflictWarning "1" --> "2" CareTask : compares
+    ConflictWarning "1" --> "2" Pet : belongs to
+    ConflictWarning "1" *-- "1" TimeWindow : contests
+    OwnerPreferences "1" *-- "0..*" TimeWindow : blocks
