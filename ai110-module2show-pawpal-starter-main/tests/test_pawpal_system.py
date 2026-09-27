@@ -5,6 +5,11 @@ containers, constraints, then the scheduler. The scheduler tests carry the
 weight -- they cover the behaviors that would actually ruin someone's day if
 they broke (double-booking, ignored deadlines, blown time budgets).
 
+The classes after TestDemoHousehold are the edge cases: invalid input, missed
+work, the recurring lifecycle over many days, ties in the sort, the ends of the
+day, and who gets named the winner of a contested time. Several of them are
+regression tests -- their docstrings say what the old behavior was.
+
 Run with:  pytest
 """
 
@@ -16,6 +21,7 @@ import pytest
 
 from main import build_demo_household
 from pawpal_system import (
+    MINUTES_PER_DAY,
     CareTask,
     DailyPlan,
     Owner,
@@ -27,6 +33,7 @@ from pawpal_system import (
     Recurrence,
     ScheduledTask,
     Scheduler,
+    SchedulingStrategy,
     TaskCategory,
     TimeWindow,
 )
@@ -922,3 +929,832 @@ class TestDemoHousehold:
             owner, WEDNESDAY
         )
         assert "not scheduled" in plan.conflicts[0].outcome
+
+
+# ---------------------------------------------------------------------------
+# Invalid input -- the shapes that used to crash a plan
+# ---------------------------------------------------------------------------
+
+
+class TestTaskValidation:
+    """A task no scheduler could place is refused where it is written."""
+
+    @pytest.mark.parametrize("bad", [0, -1, -30])
+    def test_non_positive_duration_is_refused(self, bad):
+        """This used to surface as a TimeWindow error in the middle of a plan.
+
+        A zero-minute task reached `_next_slot`, which built a window ending
+        where it started, and the whole household's plan died on a message
+        about two clock times the caller never wrote.
+        """
+        with pytest.raises(ValueError, match="duration must be positive"):
+            CareTask("Ghost", bad)
+
+    def test_duration_longer_than_a_day_is_refused(self):
+        with pytest.raises(ValueError, match="longer than a day"):
+            CareTask("Marathon", MINUTES_PER_DAY + 1)
+
+    def test_a_whole_day_is_allowed(self):
+        """The boundary stays legal: absurd, but not incoherent."""
+        assert CareTask("Vigil", MINUTES_PER_DAY).duration_minutes == MINUTES_PER_DAY
+
+    def test_the_successor_of_a_valid_task_is_valid(self):
+        """`replace` re-runs validation, so rollover must not trip over it."""
+        task = CareTask("Walk", 30, recurrence=Recurrence.DAILY)
+        assert task.mark_complete(on=WEDNESDAY).duration_minutes == 30
+
+    def test_contradictory_bounds_are_reported_not_raised(self, prefs):
+        """Bad time bounds are the owner's to fix, so the plan explains them.
+
+        The UI collects `earliest_start` and `latest_finish` as two independent
+        time inputs with no cross-check, so 18:00-09:00 is a couple of clicks
+        away. Raising here would take the app down on its next rerun, and this
+        module answers input the owner can fix with an explanation -- the same
+        choice `ConflictWarning` makes.
+        """
+        pet = Pet("Mochi", "cat")
+        pet.add_task(
+            CareTask(
+                "Impossible", 30, earliest_start=time(18, 0), latest_finish=time(9, 0)
+            )
+        )
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert not plan.scheduled
+        assert "cannot hold 30 min" in plan.skipped[0].reason
+
+    def test_impossible_bounds_are_distinguished_from_a_crowded_day(self):
+        """Both end with the task off the plan; only one can be fixed by time."""
+        impossible = CareTask(
+            "Impossible", 30, earliest_start=time(18, 0), latest_finish=time(9, 0)
+        )
+        tight = CareTask(
+            "Tight", 30, earliest_start=time(8, 0), latest_finish=time(8, 30)
+        )
+        assert impossible.has_impossible_bounds()
+        assert not tight.has_impossible_bounds()
+        assert not CareTask("Free", 30).has_impossible_bounds()
+
+
+# ---------------------------------------------------------------------------
+# Overdue work -- a task that came due and was never done
+# ---------------------------------------------------------------------------
+
+
+class TestOverdueTasks:
+    """A missed task must not disappear from every later plan."""
+
+    def test_a_missed_one_off_stays_due(self):
+        """The case with no second chance: ONCE cannot come back on its own."""
+        vet = CareTask(
+            "Vet visit", 45, recurrence=Recurrence.ONCE, anchor_date=LAST_WEDNESDAY
+        )
+        assert vet.is_due_on(LAST_WEDNESDAY)
+        assert vet.is_due_on(WEDNESDAY)
+        assert vet.is_overdue_on(WEDNESDAY)
+        assert vet.days_overdue(WEDNESDAY) == 7
+
+    def test_completing_a_missed_one_off_clears_it(self):
+        vet = CareTask(
+            "Vet visit", 45, recurrence=Recurrence.ONCE, anchor_date=LAST_WEDNESDAY
+        )
+        vet.mark_complete(on=WEDNESDAY)
+        assert not vet.is_due_on(WEDNESDAY)
+        assert not vet.is_overdue_on(THURSDAY)
+
+    def test_a_one_off_is_not_overdue_before_its_date(self):
+        vet = CareTask("Vet visit", 45, recurrence=Recurrence.ONCE, anchor_date=THURSDAY)
+        assert not vet.is_overdue_on(WEDNESDAY)
+        assert vet.days_overdue(WEDNESDAY) == 0
+
+    def test_a_missed_weekly_shows_up_the_next_day_too(self):
+        brush = CareTask(
+            "Brush", 15, recurrence=Recurrence.WEEKLY, anchor_date=LAST_WEDNESDAY
+        )
+        assert brush.is_overdue_on(LAST_WEDNESDAY + timedelta(days=1))
+        assert brush.is_due_on(WEDNESDAY)
+
+    def test_a_daily_task_never_accumulates_a_backlog(self):
+        """DAILY is already due every day; missed days must not pile up."""
+        walk = CareTask(
+            "Walk", 30, recurrence=Recurrence.DAILY, anchor_date=LAST_WEDNESDAY
+        )
+        assert walk.is_due_on(WEDNESDAY)
+        assert not walk.is_overdue_on(WEDNESDAY)
+        assert walk.days_overdue(WEDNESDAY) == 0
+
+    def test_an_unanchored_task_is_never_overdue(self):
+        """With no anchor there is no date it was supposed to have happened."""
+        brush = CareTask("Brush", 15, recurrence=Recurrence.WEEKLY)
+        assert not brush.is_overdue_on(WEDNESDAY)
+
+    def test_a_completed_task_is_never_overdue(self):
+        vet = CareTask(
+            "Vet", 45, recurrence=Recurrence.ONCE, anchor_date=LAST_WEDNESDAY
+        )
+        vet.mark_complete(on=LAST_WEDNESDAY)
+        assert not vet.is_overdue_on(WEDNESDAY)
+
+    def test_rollover_still_keeps_a_successor_out_of_today(self):
+        """The invariant overdue could have broken, stated outright.
+
+        Overdue looks strictly backwards and a successor is anchored forwards,
+        so finishing today's walk must not make tomorrow's copy appear today.
+        """
+        pet = Pet("Mochi", "cat")
+        pet.add_task(
+            CareTask("Walk", 30, recurrence=Recurrence.DAILY, anchor_date=WEDNESDAY)
+        )
+        successor = pet.complete_task("Walk", on=WEDNESDAY)
+        assert not successor.is_overdue_on(WEDNESDAY)
+        assert pet.tasks_due_on(WEDNESDAY) == []
+        assert [t.title for t in pet.tasks_due_on(THURSDAY)] == ["Walk"]
+
+    def test_a_weekly_successor_is_not_overdue_in_between(self):
+        pet = Pet("Mochi", "cat")
+        pet.add_task(
+            CareTask("Brush", 15, recurrence=Recurrence.WEEKLY, anchor_date=WEDNESDAY)
+        )
+        successor = pet.complete_task("Brush", on=WEDNESDAY)
+        assert not successor.is_overdue_on(THURSDAY)
+        assert pet.tasks_due_on(THURSDAY) == []
+
+    def test_the_plan_says_how_late_an_overdue_task_is(self, prefs):
+        pet = Pet("Mochi", "cat")
+        pet.add_task(
+            CareTask(
+                "Vet visit", 45, recurrence=Recurrence.ONCE, anchor_date=LAST_WEDNESDAY
+            )
+        )
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert "overdue since 2026-09-16 (7 days late)" in plan.scheduled[0].reason
+        assert "overdue since" in plan.explain()
+
+    def test_one_day_late_reads_as_one_day(self, prefs):
+        pet = Pet("Mochi", "cat")
+        pet.add_task(
+            CareTask("Vet", 45, recurrence=Recurrence.ONCE, anchor_date=WEDNESDAY)
+        )
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), THURSDAY)
+        assert "(1 day late)" in plan.scheduled[0].reason
+
+    def test_a_skipped_overdue_task_says_it_was_already_late(self):
+        """The worst thing a plan can contain: late already, and still not done."""
+        prefs = OwnerPreferences(
+            day_start=time(8, 0), day_end=time(20, 0), max_daily_minutes=10
+        )
+        pet = Pet("Mochi", "cat")
+        pet.add_task(
+            CareTask(
+                "Vet visit", 45, recurrence=Recurrence.ONCE, anchor_date=LAST_WEDNESDAY
+            )
+        )
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert "overdue since" in plan.skipped[0].reason
+        assert "daily limit" in plan.skipped[0].reason
+
+
+# ---------------------------------------------------------------------------
+# The recurring lifecycle -- removing, resetting, repeating
+# ---------------------------------------------------------------------------
+
+
+class TestRecurringTaskLifecycle:
+    @staticmethod
+    def _pet_with_daily_walk():
+        pet = Pet("Mochi", "cat")
+        pet.add_task(
+            CareTask("Walk", 30, recurrence=Recurrence.DAILY, anchor_date=WEDNESDAY)
+        )
+        return pet
+
+    def test_remove_task_takes_the_live_instance_not_the_record(self):
+        """Removing a rolled-over task has to actually stop it coming back.
+
+        Completion leaves the record first in the list and the successor after
+        it, so removing the first match deleted the history and left the task
+        due again tomorrow -- reported as a success.
+        """
+        pet = self._pet_with_daily_walk()
+        pet.complete_task("Walk", on=WEDNESDAY)
+        assert pet.remove_task("Walk")
+        assert pet.tasks_due_on(THURSDAY) == []
+        assert [t.completed for t in pet.tasks] == [True]
+
+    def test_remove_task_falls_back_to_a_completed_record(self):
+        """With nothing open left, the record is what removing must mean."""
+        pet = self._pet_with_daily_walk()
+        pet.tasks[0].mark_complete(on=WEDNESDAY)
+        assert pet.remove_task("Walk")
+        assert pet.tasks == []
+
+    def test_remove_missing_title_is_still_false(self):
+        assert not self._pet_with_daily_walk().remove_task("Nope")
+
+    def test_reset_task_undoes_the_whole_completion(self):
+        """Clearing the flag alone left two live copies of the same task."""
+        pet = self._pet_with_daily_walk()
+        pet.complete_task("Walk", on=WEDNESDAY)
+        assert pet.reset_task("Walk")
+        assert len(pet.tasks) == 1
+        assert [t.title for t in pet.tasks_due_on(WEDNESDAY)] == ["Walk"]
+        assert [t.title for t in pet.tasks_due_on(THURSDAY)] == ["Walk"]
+
+    def test_reset_task_does_not_double_book_the_day(self, prefs):
+        pet = self._pet_with_daily_walk()
+        pet.complete_task("Walk", on=WEDNESDAY)
+        pet.reset_task("Walk")
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert len(plan.scheduled) == 1
+        assert not plan.is_double_booked()
+
+    def test_reset_task_without_a_completion_is_false(self):
+        assert not self._pet_with_daily_walk().reset_task("Walk")
+
+    def test_reset_task_handles_a_one_off(self):
+        """A ONCE task files no successor, so there is nothing to withdraw."""
+        pet = Pet("Mochi", "cat")
+        pet.add_task(
+            CareTask("Vet", 45, recurrence=Recurrence.ONCE, anchor_date=WEDNESDAY)
+        )
+        pet.complete_task("Vet", on=WEDNESDAY)
+        assert pet.reset_task("Vet")
+        assert len(pet.tasks) == 1
+        assert [t.title for t in pet.tasks_due_on(WEDNESDAY)] == ["Vet"]
+
+    def test_completing_retroactively_puts_the_task_back_on_today(self):
+        """Surprising but right: catching up on yesterday lands on today.
+
+        Asserted deliberately. An owner logging yesterday's walk this morning
+        should still see today's walk to do, not skip a day.
+        """
+        pet = self._pet_with_daily_walk()
+        successor = pet.complete_task("Walk", on=WEDNESDAY - timedelta(days=1))
+        assert successor.anchor_date == WEDNESDAY
+        assert [t.title for t in pet.tasks_due_on(WEDNESDAY)] == ["Walk"]
+
+    def test_completing_ahead_of_time_skips_to_the_day_after(self):
+        pet = self._pet_with_daily_walk()
+        successor = pet.complete_task("Walk", on=THURSDAY)
+        assert successor.anchor_date == THURSDAY + timedelta(days=1)
+        assert pet.tasks_due_on(WEDNESDAY) == []
+
+    def test_ten_days_of_rollover_stay_exactly_one_task_a_day(self, prefs):
+        """The repeating case end to end: no duplicates, no gaps, no clashes."""
+        pet = self._pet_with_daily_walk()
+        owner = Owner("J", [pet], prefs)
+        for offset in range(10):
+            day = WEDNESDAY + timedelta(days=offset)
+            assert [t.title for t in pet.tasks_due_on(day)] == ["Walk"], f"day {offset}"
+            plan = Scheduler(prefs).build_plan(owner, day)
+            assert len(plan.scheduled) == 1
+            assert not plan.is_double_booked()
+            pet.complete_task("Walk", on=day)
+        assert len(pet.tasks) == 11  # ten records, plus the live successor
+
+
+# ---------------------------------------------------------------------------
+# Ordering -- the sort has to be total and stable
+# ---------------------------------------------------------------------------
+
+
+class TestOrderingEdgeCases:
+    def test_a_long_important_task_still_outranks_a_short_trivial_one(self):
+        """Duration must only break ties, never cross a priority band.
+
+        The bands were 1000 apart while a task may legally run for a whole day,
+        so a five-minute LOW task outranked a 1100-minute MEDIUM one.
+        """
+        long_medium = CareTask("Kennel day", 1100, Priority.MEDIUM)
+        short_low = CareTask("Treat", 5, Priority.LOW)
+        assert long_medium.weight() > short_low.weight()
+        assert PriorityFirstStrategy().order([short_low, long_medium])[0] is long_medium
+
+    def test_required_outranks_everything_even_at_full_length(self):
+        required = CareTask("Meds", MINUTES_PER_DAY, Priority.LOW, is_required=True)
+        urgent = CareTask("Walk", 1, Priority.HIGH)
+        assert required.weight() > urgent.weight()
+
+    @pytest.mark.parametrize(
+        "strategy", [PriorityFirstStrategy(), QuickWinsStrategy()]
+    )
+    def test_ordering_an_empty_list(self, strategy):
+        assert strategy.order([]) == []
+
+    @pytest.mark.parametrize(
+        "strategy", [PriorityFirstStrategy(), QuickWinsStrategy()]
+    )
+    def test_indistinguishable_tasks_keep_their_input_order(self, strategy):
+        """Both sorts must be stable, or the plan reshuffles between runs."""
+        tasks = [CareTask(name, 20, Priority.MEDIUM) for name in ("A", "B", "C")]
+        assert [t.title for t in strategy.order(tasks)] == ["A", "B", "C"]
+
+    def test_the_plan_is_deterministic(self, prefs):
+        """Same household, same day, same plan -- twice."""
+
+        def household():
+            ana, bo = Pet("Ana", "dog"), Pet("Bo", "cat")
+            ana.add_task(CareTask("Walk", 20, Priority.MEDIUM))
+            ana.add_task(CareTask("Feed", 20, Priority.MEDIUM))
+            bo.add_task(CareTask("Brush", 20, Priority.MEDIUM))
+            return Owner("J", [ana, bo], prefs)
+
+        first = Scheduler(prefs).build_plan(household(), WEDNESDAY)
+        second = Scheduler(prefs).build_plan(household(), WEDNESDAY)
+        assert first.to_rows() == second.to_rows()
+
+    def test_ties_resolve_by_pet_order_then_task_order(self, prefs):
+        """With nothing to choose between them, the owner's own order wins."""
+        ana, bo = Pet("Ana", "dog"), Pet("Bo", "cat")
+        ana.add_task(CareTask("A1", 20, Priority.MEDIUM))
+        ana.add_task(CareTask("A2", 20, Priority.MEDIUM))
+        bo.add_task(CareTask("B1", 20, Priority.MEDIUM))
+        plan = Scheduler(prefs).build_plan(Owner("J", [ana, bo], prefs), WEDNESDAY)
+        assert [s.task.title for s in plan.scheduled] == ["A1", "A2", "B1"]
+
+    def test_a_strategy_inventing_a_task_does_not_reach_the_plan(self, prefs):
+        """The extension point's contract: order the tasks, do not add any.
+
+        A smuggled task has no pet, and guessing one would put work on the
+        wrong animal. Failing is the honest outcome.
+        """
+
+        class Rogue(SchedulingStrategy):
+            name = "rogue"
+
+            def order(self, tasks):
+                return list(tasks) + [CareTask("Smuggled", 10)]
+
+            def describe(self):
+                return "adds a task nobody asked for"
+
+        pet = Pet("Mochi", "cat")
+        pet.add_task(CareTask("Walk", 30))
+        with pytest.raises(KeyError):
+            Scheduler(prefs, Rogue()).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+
+
+# ---------------------------------------------------------------------------
+# Placement -- the edges of the day and the budget
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerEdgeCases:
+    def test_a_pinned_start_is_honored_over_the_break(self, prefs):
+        """`break_minutes` applies only where the scheduler picks the time.
+
+        A task that names 08:30 gets 08:30, back to back with the one before
+        it. Stated because `test_leaves_a_break_between_tasks` reads like an
+        unconditional rule and is not one.
+        """
+        pet = Pet("Mochi", "cat")
+        pet.add_task(CareTask("Walk", 30))
+        pet.add_task(CareTask("Meds", 15, earliest_start=time(8, 30)))
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert [(s.task.title, s.slot.start) for s in plan.scheduled] == [
+            ("Walk", time(8, 0)),
+            ("Meds", time(8, 30)),
+        ]
+        assert not plan.is_double_booked()
+
+    def test_the_budget_does_not_know_about_busy_time(self):
+        """`max_daily_minutes` and `available_minutes()` are different numbers.
+
+        The scheduler spends against the budget alone, so a day that is mostly
+        busy loses tasks to missing slots, not to a blown budget. Pinned down
+        because the two are easy to confuse -- `available_minutes()` exists and
+        the scheduler never consults it.
+        """
+        prefs = OwnerPreferences(
+            day_start=time(8, 0),
+            day_end=time(20, 0),
+            max_daily_minutes=180,
+            busy_windows=[TimeWindow(time(9, 0), time(20, 0))],
+        )
+        assert prefs.available_minutes() == 60
+        pet = Pet("Mochi", "cat")
+        for i in range(4):
+            pet.add_task(CareTask(f"Walk {i}", 20))
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert plan.total_minutes() < prefs.max_daily_minutes
+        assert plan.skipped
+        assert all("no free slot" in item.reason for item in plan.skipped)
+
+    def test_a_zero_budget_schedules_nothing(self):
+        prefs = OwnerPreferences(max_daily_minutes=0)
+        pet = Pet("Mochi", "cat")
+        pet.add_task(CareTask("Walk", 30))
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert not plan.scheduled
+        assert "daily limit" in plan.skipped[0].reason
+
+    def test_no_break_packs_tasks_back_to_back(self):
+        prefs = OwnerPreferences(
+            day_start=time(8, 0), day_end=time(20, 0), break_minutes=0
+        )
+        pet = Pet("Mochi", "cat")
+        pet.add_task(CareTask("Walk", 30))
+        pet.add_task(CareTask("Feed", 30))
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert [s.slot.start for s in plan.scheduled] == [time(8, 0), time(8, 30)]
+
+    def test_a_break_longer_than_the_day_still_places_the_first_task(self):
+        prefs = OwnerPreferences(
+            day_start=time(8, 0), day_end=time(9, 0), break_minutes=600
+        )
+        pet = Pet("Mochi", "cat")
+        pet.add_task(CareTask("Walk", 30))
+        pet.add_task(CareTask("Feed", 10))
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert len(plan.scheduled) == 1
+        assert len(plan.skipped) == 1
+
+    def test_earliest_start_before_the_day_opens_waits_for_the_day(self, prefs):
+        pet = Pet("Mochi", "cat")
+        pet.add_task(CareTask("Walk", 30, earliest_start=time(6, 0)))
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert plan.scheduled[0].slot.start == time(8, 0)
+
+    def test_earliest_start_after_the_day_closes_is_skipped(self, prefs):
+        pet = Pet("Mochi", "cat")
+        pet.add_task(CareTask("Walk", 30, earliest_start=time(22, 0)))
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert not plan.scheduled
+        assert plan.skipped
+
+    def test_a_busy_window_ending_at_day_start_costs_nothing(self):
+        prefs = OwnerPreferences(
+            day_start=time(8, 0),
+            day_end=time(20, 0),
+            busy_windows=[TimeWindow(time(6, 0), time(8, 0))],
+        )
+        pet = Pet("Mochi", "cat")
+        pet.add_task(CareTask("Walk", 30))
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert plan.scheduled[0].slot.start == time(8, 0)
+
+    def test_a_task_cannot_run_past_midnight(self):
+        """The day is a single date, so nothing may spill over its end."""
+        prefs = OwnerPreferences(
+            day_start=time(23, 30), day_end=time(23, 59), max_daily_minutes=240
+        )
+        pet = Pet("Mochi", "cat")
+        pet.add_task(CareTask("Walk", 45))
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert not plan.scheduled
+        assert plan.skipped
+
+    def test_an_aliased_task_is_refused(self, prefs):
+        """One CareTask under two pets used to be credited to the last pet.
+
+        Both slots were rendered under Bo and Ana's day came back empty. The
+        instance is shared, so completing it for one pet would have completed
+        it for the other as well.
+        """
+        shared = CareTask("Brush", 20)
+        ana, bo = Pet("Ana", "dog"), Pet("Bo", "cat")
+        ana.add_task(shared)
+        bo.add_task(shared)
+        with pytest.raises(ValueError, match="shared by Ana and Bo"):
+            Scheduler(prefs).build_plan(Owner("J", [ana, bo], prefs), WEDNESDAY)
+
+    def test_two_equal_but_separate_tasks_are_fine(self, prefs):
+        """Identical fields are not identity: each pet gets its own brushing."""
+        ana, bo = Pet("Ana", "dog"), Pet("Bo", "cat")
+        ana.add_task(CareTask("Brush", 20))
+        bo.add_task(CareTask("Brush", 20))
+        plan = Scheduler(prefs).build_plan(Owner("J", [ana, bo], prefs), WEDNESDAY)
+        assert [s.pet.name for s in plan.scheduled] == ["Ana", "Bo"]
+        assert not plan.is_double_booked()
+
+
+# ---------------------------------------------------------------------------
+# Conflict attribution -- who is named the winner, and when nobody is
+# ---------------------------------------------------------------------------
+
+
+class TestConflictAttribution:
+    @staticmethod
+    def _plan(prefs, entries):
+        """Build a plan from (pet_name, task) pairs, one Pet per distinct name."""
+        pets: dict[str, Pet] = {}
+        for pet_name, task in entries:
+            pets.setdefault(pet_name, Pet(pet_name, "dog")).add_task(task)
+        owner = Owner("Jordan", list(pets.values()), prefs)
+        return Scheduler(prefs).build_plan(owner, WEDNESDAY)
+
+    @staticmethod
+    def _both_want_half_seven():
+        return [
+            ("Ana", CareTask("Walk", 30, earliest_start=time(7, 30))),
+            ("Bo", CareTask("Feed", 30, earliest_start=time(7, 30))),
+        ]
+
+    def test_neither_task_kept_a_time_the_day_never_offered(self, prefs):
+        """Both asked for 07:30 on a day that opens at 08:00.
+
+        The report used to name one of them the winner and say the other had
+        moved, which pointed the owner at the wrong task: the one it called the
+        loser had actually been given the earlier slot.
+        """
+        plan = self._plan(prefs, self._both_want_half_seven())
+        assert len(plan.conflicts) == 1
+        clash = plan.conflicts[0]
+        assert clash.both_displaced
+        assert "neither kept it" in clash.outcome
+        assert "neither kept it" in clash.label()
+
+    def test_a_displaced_pair_is_reported_earliest_first(self, prefs):
+        plan = self._plan(prefs, self._both_want_half_seven())
+        clash = plan.conflicts[0]
+        first = plan._placement_of(clash.first_task)
+        second = plan._placement_of(clash.second_task)
+        assert first.slot.start < second.slot.start
+
+    def test_a_kept_time_is_still_reported_as_a_win(self, prefs):
+        """The ordinary case must not regress into the both-displaced shape."""
+        plan = self._plan(
+            prefs,
+            [
+                ("Ana", CareTask("Walk", 30, earliest_start=time(9, 0))),
+                ("Bo", CareTask("Feed", 10, earliest_start=time(9, 0))),
+            ],
+        )
+        clash = plan.conflicts[0]
+        assert not clash.both_displaced
+        assert plan._placement_of(clash.first_task).slot == clash.wanted
+        assert "moved to" in clash.outcome
+
+    def test_both_tasks_skipped_over_the_same_time(self):
+        """Nothing was placed, so nothing can be called the winner."""
+        prefs = OwnerPreferences(
+            day_start=time(8, 0), day_end=time(20, 0), max_daily_minutes=0
+        )
+        plan = self._plan(
+            prefs,
+            [
+                ("Ana", CareTask("Walk", 30, earliest_start=time(9, 0))),
+                ("Bo", CareTask("Feed", 30, earliest_start=time(9, 0))),
+            ],
+        )
+        assert not plan.scheduled
+        clash = plan.conflicts[0]
+        assert clash.both_displaced
+        assert "not scheduled" in clash.outcome
+
+    def test_a_request_running_past_midnight_is_ignored_not_raised(self):
+        """`wanted_window()` gives up on it, so detection has to as well."""
+        prefs = OwnerPreferences(
+            day_start=time(8, 0), day_end=time(23, 59), max_daily_minutes=240
+        )
+        plan = self._plan(
+            prefs,
+            [
+                ("Ana", CareTask("Walk", 30, earliest_start=time(23, 50))),
+                ("Bo", CareTask("Feed", 30, earliest_start=time(23, 50))),
+            ],
+        )
+        assert plan.conflicts == []
+        assert plan.detect_conflicts() == []
+
+    def test_no_shape_of_clash_double_books(self, prefs):
+        """The output invariant, across every clash this class builds."""
+        shapes = [
+            self._both_want_half_seven(),
+            [
+                ("Ana", CareTask("Walk", 30, earliest_start=time(9, 0))),
+                ("Bo", CareTask("Feed", 10, earliest_start=time(9, 0))),
+                ("Cy", CareTask("Play", 15, earliest_start=time(9, 0))),
+            ],
+            [
+                (
+                    "Ana",
+                    CareTask(
+                        "Walk",
+                        30,
+                        earliest_start=time(8, 0),
+                        latest_finish=time(8, 30),
+                    ),
+                ),
+                (
+                    "Bo",
+                    CareTask(
+                        "Meds",
+                        30,
+                        earliest_start=time(8, 0),
+                        latest_finish=time(8, 30),
+                    ),
+                ),
+            ],
+        ]
+        for entries in shapes:
+            plan = self._plan(prefs, entries)
+            assert not plan.is_double_booked()
+
+
+# ---------------------------------------------------------------------------
+# Editing one row -- identity, not title
+# ---------------------------------------------------------------------------
+
+
+class TestIdentityBasedEditing:
+    """Acting on the row that was clicked, where a title picks out two rows."""
+
+    @staticmethod
+    def _rolled_over_pet():
+        """A pet whose single task has been completed once, leaving two rows.
+
+        This is the ordinary state of any recurring task after one day's use,
+        and the state in which a title stops identifying anything.
+        """
+        pet = Pet("Mochi", "cat")
+        pet.add_task(
+            CareTask("Walk", 30, recurrence=Recurrence.DAILY, anchor_date=WEDNESDAY)
+        )
+        pet.complete_task("Walk", on=WEDNESDAY)
+        return pet
+
+    def test_remove_instance_takes_the_row_it_was_given(self):
+        """Deleting the completed record must leave tomorrow's walk alone."""
+        pet = self._rolled_over_pet()
+        record, successor = pet.tasks
+        assert pet.remove_instance(record)
+        assert [t is successor for t in pet.tasks] == [True]
+        assert [t.title for t in pet.tasks_due_on(THURSDAY)] == ["Walk"]
+
+    def test_remove_instance_can_take_the_successor_instead(self):
+        """And deleting the live one must stop the task coming back."""
+        pet = self._rolled_over_pet()
+        record, successor = pet.tasks
+        assert pet.remove_instance(successor)
+        assert [t is record for t in pet.tasks] == [True]
+        assert pet.tasks_due_on(THURSDAY) == []
+
+    def test_remove_instance_ignores_an_equal_but_foreign_task(self):
+        """Equal fields are not identity -- CareTask compares value by value."""
+        pet = self._rolled_over_pet()
+        twin = CareTask(
+            "Walk", 30, recurrence=Recurrence.DAILY, anchor_date=WEDNESDAY
+        )
+        assert not pet.remove_instance(twin)
+        assert len(pet.tasks) == 2
+
+    def test_undo_completion_restores_the_record_and_drops_the_successor(self):
+        pet = self._rolled_over_pet()
+        record, successor = pet.tasks
+        assert pet.undo_completion(record)
+        assert not record.completed
+        assert record.completed_on is None
+        assert not any(t is successor for t in pet.tasks)
+        assert [t.title for t in pet.tasks_due_on(WEDNESDAY)] == ["Walk"]
+
+    def test_undo_completion_refuses_an_open_task(self):
+        """Undo only means anything on a row that says "done"."""
+        pet = self._rolled_over_pet()
+        assert not pet.undo_completion(pet.tasks[1])
+        assert len(pet.tasks) == 2
+
+    def test_undo_completion_refuses_a_foreign_task(self):
+        pet = self._rolled_over_pet()
+        stranger = CareTask("Walk", 30)
+        stranger.mark_complete(on=WEDNESDAY)
+        assert not pet.undo_completion(stranger)
+        assert len(pet.tasks) == 2
+
+    def test_undo_then_replan_shows_the_task_once(self, prefs):
+        """The point of withdrawing the successor: no duplicate on the day."""
+        pet = self._rolled_over_pet()
+        pet.undo_completion(pet.tasks[0])
+        plan = Scheduler(prefs).build_plan(Owner("J", [pet], prefs), WEDNESDAY)
+        assert len(plan.scheduled) == 1
+        assert not plan.is_double_booked()
+
+    def test_the_title_wrappers_still_behave(self):
+        """`remove_task` and `reset_task` delegate but keep their contracts."""
+        pet = self._rolled_over_pet()
+        record = pet.tasks[0]
+        assert pet.remove_task("Walk")  # prefers the live instance
+        assert [t is record for t in pet.tasks] == [True]
+
+        pet = self._rolled_over_pet()
+        assert pet.reset_task("Walk")  # most recent completion, successor gone
+        assert len(pet.tasks) == 1
+        assert not pet.tasks[0].completed
+
+
+# ---------------------------------------------------------------------------
+# Sorting a finished plan into a timeline
+# ---------------------------------------------------------------------------
+
+
+class TestSortByTime:
+    @staticmethod
+    def _slots(*hours):
+        """One half-hour ScheduledTask per hour given, in the order given."""
+        pet = Pet("Mochi", "cat")
+        return [
+            ScheduledTask(
+                CareTask(f"{hour:02d}00", 30),
+                pet,
+                TimeWindow(time(hour, 0), time(hour, 30)),
+            )
+            for hour in hours
+        ]
+
+    def test_a_reversed_list_comes_back_in_order(self):
+        items = self._slots(19, 12, 8)
+        ordered = Scheduler.sort_by_time(items)
+        assert [s.slot.start.hour for s in ordered] == [8, 12, 19]
+
+    def test_sorting_does_not_mutate_the_input(self):
+        """`sorted` builds a new list, so the caller's order survives."""
+        items = self._slots(19, 12, 8)
+        Scheduler.sort_by_time(items)
+        assert [s.slot.start.hour for s in items] == [19, 12, 8]
+
+    def test_it_needs_no_scheduler_instance(self):
+        """A staticmethod: ordering a list wants no preferences or strategy."""
+        assert Scheduler.sort_by_time([]) == []
+
+    def test_minutes_inside_an_hour_sort_correctly(self):
+        """The key is a real `time`, which is why this needs no thought.
+
+        Comparing "08:05" against "08:45" as text happens to give the same
+        answer, but only because clock strings are zero padded to a fixed
+        width; the moment anything formats an hour without its leading zero,
+        "8:45" sorts before "08:05". Sorting the time object cannot go wrong
+        that way, so the module never puts a clock into a string to compare it.
+        """
+        pet = Pet("Mochi", "cat")
+        late = ScheduledTask(
+            CareTask("late", 10), pet, TimeWindow(time(8, 45), time(8, 55))
+        )
+        early = ScheduledTask(
+            CareTask("early", 10), pet, TimeWindow(time(8, 5), time(8, 15))
+        )
+        ordered = Scheduler.sort_by_time([late, early])
+        assert [s.task.title for s in ordered] == ["early", "late"]
+
+
+# ---------------------------------------------------------------------------
+# Filtering the household
+# ---------------------------------------------------------------------------
+
+
+class TestFindTasks:
+    @staticmethod
+    def _household():
+        """Two pets, one of which has a completed task and its successor."""
+        biscuit, mochi = Pet("Biscuit", "dog"), Pet("Mochi", "cat")
+        biscuit.add_task(CareTask("Walk", 30))
+        biscuit.add_task(CareTask("Feed", 10))
+        mochi.add_task(CareTask("Brush", 15))
+        mochi.complete_task("Brush", on=WEDNESDAY)
+        return Owner("Jordan", [biscuit, mochi])
+
+    def test_no_filters_returns_the_whole_household(self):
+        owner = self._household()
+        assert len(owner.find_tasks()) == len(owner.all_tasks())
+
+    def test_each_task_is_paired_with_the_pet_that_owns_it(self):
+        """The pairing is the point: a bare CareTask cannot say whose it is."""
+        owner = self._household()
+        for pet, task in owner.find_tasks():
+            assert any(owned is task for owned in pet.tasks)
+
+    def test_filter_by_pet_name_ignores_case(self):
+        """Matched through `get_pet`, so a typed filter behaves like a lookup."""
+        found = self._household().find_tasks(pet_name="mOcHi")
+        assert found
+        assert {pet.name for pet, _ in found} == {"Mochi"}
+
+    def test_an_unknown_pet_name_returns_nothing(self):
+        """A filter that silently stops filtering is worse than an empty list."""
+        assert self._household().find_tasks(pet_name="Rex") == []
+
+    def test_filter_by_completion(self):
+        owner = self._household()
+        done = owner.find_tasks(completed=True)
+        assert [task.title for _, task in done] == ["Brush"]
+        assert all(task.completed for _, task in done)
+
+    def test_the_rolled_over_pair_splits_across_the_two_states(self):
+        """One title, two rows: the record is done, the successor is not."""
+        owner = self._household()
+        done = owner.find_tasks(pet_name="Mochi", completed=True)
+        todo = owner.find_tasks(pet_name="Mochi", completed=False)
+        assert [t.title for _, t in done] == ["Brush"]
+        assert [t.title for _, t in todo] == ["Brush"]
+        assert done[0][1] is not todo[0][1]
+
+    def test_filters_combine(self):
+        owner = self._household()
+        found = owner.find_tasks(pet_name="Biscuit", completed=False)
+        assert [task.title for _, task in found] == ["Walk", "Feed"]
+
+    def test_completed_false_is_not_the_same_as_unfiltered(self):
+        """None means "do not care"; False means "not done yet"."""
+        owner = self._household()
+        assert len(owner.find_tasks(completed=False)) < len(owner.find_tasks())
+
+    def test_an_empty_household_filters_to_nothing(self):
+        assert Owner("Jordan").find_tasks(completed=False) == []

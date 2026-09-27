@@ -213,6 +213,60 @@ def demo_rollover(owner: Owner, today: date) -> None:
     print("  (completed tasks are gone; their successors are not due yet)")
 
 
+def demo_sorting_and_filtering(owner: Owner, today: date) -> None:
+    """Add tasks out of order, then sort and filter them back into shape.
+
+    Runs last, after `demo_rollover`, so the household actually contains some
+    completed work -- filtering on completion against a list where nothing is
+    done would print the same thing twice and prove nothing.
+    """
+    print()
+    print("-" * 62)
+    print("Adding three tasks to Biscuit, deliberately out of order:")
+
+    biscuit = owner.get_pet("Biscuit")
+    out_of_order = [
+        CareTask("Bedtime brush", 10, Priority.LOW, TaskCategory.GROOMING,
+                 earliest_start=time(19, 30)),
+        CareTask("Sunrise sniff", 10, Priority.MEDIUM, TaskCategory.EXERCISE,
+                 earliest_start=time(7, 15)),
+        CareTask("Evening treat", 5, Priority.LOW, TaskCategory.FEEDING,
+                 earliest_start=time(18, 30)),
+    ]
+    for task in out_of_order:
+        biscuit.add_task(task)
+        print(f"  entered: {task.title} (wants {task.earliest_start:%H:%M})")
+
+    plan = Scheduler(owner.preferences).build_plan(owner, today)
+    print("\n  The plan comes back in clock order, not entry order:")
+    for item in plan.scheduled:
+        print(f"    {item.slot.start:%H:%M}  {item.pet.name}: {item.task.title}")
+
+    # sort_by_time is what did that, and it is a plain staticmethod -- hand it
+    # a shuffled list and it sorts it, with no scheduler involved.
+    shuffled = list(reversed(plan.scheduled))
+    resorted = Scheduler.sort_by_time(shuffled)
+    print("\n  sort_by_time() on a reversed copy of that list:")
+    print("    before: " + ", ".join(f"{s.slot.start:%H:%M}" for s in shuffled))
+    print("    after:  " + ", ".join(f"{s.slot.start:%H:%M}" for s in resorted))
+    print(f"    input untouched: {shuffled[0].slot.start:%H:%M} still first")
+
+    print()
+    print("-" * 62)
+    print("Filtering the household with find_tasks():")
+    for label, kwargs in (
+        ("everything", {}),
+        ("Mochi only (name typed in lower case)", {"pet_name": "mochi"}),
+        ("still to do", {"completed": False}),
+        ("already done", {"completed": True}),
+        ("Biscuit, still to do", {"pet_name": "Biscuit", "completed": False}),
+        ("a pet who does not exist", {"pet_name": "Rex"}),
+    ):
+        found = owner.find_tasks(**kwargs)
+        names = ", ".join(f"{pet.name}/{task.title}" for pet, task in found)
+        print(f"  {label}: {len(found)} -> {names or '(none)'}")
+
+
 def main() -> None:
     today = date.today()
     owner = build_demo_household(today)
@@ -221,6 +275,7 @@ def main() -> None:
     print_schedule(plan)
     compare_strategies(owner, today)
     demo_rollover(owner, today)
+    demo_sorting_and_filtering(owner, today)
 
 
 if __name__ == "__main__":

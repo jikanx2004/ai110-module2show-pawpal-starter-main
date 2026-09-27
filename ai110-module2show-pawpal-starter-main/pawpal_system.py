@@ -79,6 +79,12 @@ class Priority(str, Enum):
 
 _PRIORITY_SCORES = {Priority.LOW: 1, Priority.MEDIUM: 2, Priority.HIGH: 3}
 
+# Sorting bands for `CareTask.weight`. Both are wider than the longest duration
+# a task may declare (a full day, enforced in `CareTask.__post_init__`), which
+# is what stops a long important task from sinking below a short trivial one.
+_PRIORITY_BAND = 10_000
+_REQUIRED_BAND = 100_000
+
 
 class TaskCategory(str, Enum):
     """What kind of care a task is. Used for grouping and explanations."""
@@ -221,6 +227,32 @@ class CareTask:
     anchor_date: date | None = None
     completed_on: date | None = None
 
+    def __post_init__(self) -> None:
+        """Reject a task no scheduler could place.
+
+        `TimeWindow` already refuses a zero-length span, but it refuses it deep
+        inside `_next_slot`, raising about two clock times the caller never
+        wrote. Validating here reports the mistake where it was made, the way
+        `TimeWindow` validates its own bounds.
+
+        Only the duration is checked. Contradictory time bounds -- a task due
+        after 18:00 that must finish by 09:00 -- are *not* rejected: the owner
+        can type exactly that into the UI, and this module answers bad input
+        the owner can fix with an explanation in the plan rather than an
+        exception, the same way a requested-time clash returns a
+        ConflictWarning. See `has_impossible_bounds`.
+        """
+        if self.duration_minutes <= 0:
+            raise ValueError(
+                f"{self.title!r}: duration must be positive, "
+                f"got {self.duration_minutes}"
+            )
+        if self.duration_minutes > MINUTES_PER_DAY:
+            raise ValueError(
+                f"{self.title!r}: duration {self.duration_minutes} min is "
+                "longer than a day"
+            )
+
     def mark_complete(self, on: date | None = None) -> CareTask | None:
         """Mark this task done on `on` (default today); return its successor.
 
@@ -262,19 +294,29 @@ class CareTask:
         )
 
     def reset(self) -> None:
-        """Mark this task incomplete again, e.g. at the start of a new day."""
+        """Mark this task incomplete again, e.g. at the start of a new day.
+
+        Low-level: this clears the two flags and nothing else. It does not know
+        about a successor that `Pet.complete_task` filed, so calling it on a
+        task that belongs to a pet leaves two live instances of that task and
+        the scheduler books both. Use `Pet.reset_task` for a filed task.
+        """
         self.completed = False
         self.completed_on = None
 
     def weight(self) -> float:
         """Sorting score: required beats priority, priority beats brevity.
 
-        The bands are spaced widely so they cannot bleed into each other -- no
-        pile of short low-priority tasks can outrank one required task.
+        Duration only ever breaks a tie inside a band, so the bands have to be
+        wider than any duration that can reach them. They are wider than a
+        whole day, and `__post_init__` refuses a task longer than a day -- the
+        two together are what keep the bands from bleeding: no pile of short
+        low-priority tasks can outrank one required task, and no long urgent
+        task sinks beneath a brief trivial one.
         """
-        score = self.priority.score() * 1000
+        score = self.priority.score() * _PRIORITY_BAND
         if self.is_required:
-            score += 10_000
+            score += _REQUIRED_BAND
         return float(score - self.duration_minutes)
 
     def fits_in(self, window: TimeWindow) -> bool:
@@ -323,11 +365,58 @@ class CareTask:
         span = _to_minutes(self.latest_finish) - _to_minutes(self.earliest_start)
         return span == self.duration_minutes
 
+    def is_overdue_on(self, day: date) -> bool:
+        """True when this task came due before `day` and was never completed.
+
+        A ONCE task is due on exactly one date, so without this a missed vet
+        visit drops out of every later plan: the owner is never reminded of the
+        one kind of task that cannot come back on its own. WEEKLY is included
+        for the same reason -- it would otherwise go unmentioned for six days.
+
+        Looks strictly backwards, which is what keeps rollover intact. A
+        successor is always anchored forward of the day the work was done, so a
+        completed daily task's replacement can never read as overdue today.
+
+        DAILY is excluded deliberately: it is already due every day, and missed
+        days should not pile into a backlog the owner cannot work through.
+        """
+        if self.completed or self.anchor_date is None:
+            return False
+        if self.recurrence is Recurrence.DAILY:
+            return False
+        return day > self.anchor_date
+
+    def days_overdue(self, day: date) -> int:
+        """How many days late this task is on `day`, or 0 if it is not late."""
+        if not self.is_overdue_on(day):
+            return 0
+        return (day - self.anchor_date).days
+
+    def has_impossible_bounds(self) -> bool:
+        """True when this task's own limits cannot hold its duration.
+
+        Answers a different question from `fits_in`, which judges one candidate
+        window: this judges the task against itself, so the plan can say *why*
+        nothing fitted. A 30-minute task due after 18:00 and finished by 09:00
+        is not competing badly for a crowded day, it is asking for something no
+        day contains -- and the owner needs to be told which of the two it is.
+        """
+        if self.earliest_start is None or self.latest_finish is None:
+            return False
+        span = _to_minutes(self.latest_finish) - _to_minutes(self.earliest_start)
+        return span < self.duration_minutes
+
     def is_due_on(self, day: date) -> bool:
-        """True if this task should be considered when planning `day`."""
+        """True if this task should be considered when planning `day`.
+
+        Two ways to qualify: the recurrence lands on `day`, or the task came due
+        earlier and was never done. See `is_overdue_on`.
+        """
         if self.completed:
             return False
-        return self.recurrence.occurs_on(day, self.anchor_date)
+        if self.recurrence.occurs_on(day, self.anchor_date):
+            return True
+        return self.is_overdue_on(day)
 
 
 @dataclass
@@ -351,9 +440,39 @@ class Pet:
         self.tasks.append(task)
 
     def remove_task(self, title: str) -> bool:
-        """Remove the first task with this title. Returns False if none matched."""
-        for i, task in enumerate(self.tasks):
+        """Remove one task with this title, preferring the live instance.
+
+        A rollover leaves the completed record and its successor side by side
+        under one title, the completed one first. Removing the first match
+        would delete the history and leave the task still due tomorrow, which
+        is the opposite of what removing it means. A completed record is only
+        removed when nothing open matches.
+
+        Returns False if no task matched at all.
+        """
+        for task in self.tasks:
+            if task.title == title and not task.completed:
+                return self.remove_instance(task)
+        for task in self.tasks:
             if task.title == title:
+                return self.remove_instance(task)
+        return False
+
+    def remove_instance(self, task: CareTask) -> bool:
+        """Remove this exact task object. False if it is not this pet's.
+
+        Identity rather than title, because a title is not an identifier here:
+        after a rollover one title covers both the completed record and its
+        successor. A caller holding the row a user clicked -- the UI's task
+        list -- has to be able to say which of the two it means, and asking by
+        title would delete the other one.
+
+        `CareTask` is a mutable dataclass, so two tasks with identical fields
+        compare equal; matching with `is` is the same choice
+        `DailyPlan._placement_of` makes, for the same reason.
+        """
+        for i, existing in enumerate(self.tasks):
+            if existing is task:
                 del self.tasks[i]
                 return True
         return False
@@ -373,6 +492,52 @@ class Pet:
                     self.tasks.append(successor)
                 return successor
         return None
+
+    def reset_task(self, title: str) -> bool:
+        """Undo a completion: clear the record and drop the successor it filed.
+
+        `CareTask.reset` is not enough for a task that belongs to a pet.
+        Completing one files a successor beside it, so clearing the flag alone
+        would leave two live instances of the same task and the scheduler would
+        book both. This undoes the whole completion instead.
+
+        Works on the most recent completed instance, so resetting twice walks
+        back through the history rather than undoing one day twice. Returns
+        False when no completed instance matched.
+        """
+        for task in reversed(self.tasks):
+            if task.title == title and task.completed:
+                return self.undo_completion(task)
+        return False
+
+    def undo_completion(self, task: CareTask) -> bool:
+        """Undo this exact completion, withdrawing the successor it filed.
+
+        The identity-based form of `reset_task`, for the same reason
+        `remove_instance` exists: the UI knows which row was clicked, and a
+        rolled-over task has two rows under one title.
+
+        Returns False unless `task` is a completed task of this pet.
+        """
+        if not task.completed or not any(other is task for other in self.tasks):
+            return False
+        spawned = (
+            task.recurrence.next_after(task.completed_on)
+            if task.completed_on is not None
+            else None
+        )
+        task.reset()
+        if spawned is not None:
+            for other in self.tasks:
+                if (
+                    other is not task
+                    and other.title == task.title
+                    and not other.completed
+                    and other.anchor_date == spawned
+                ):
+                    self.remove_instance(other)
+                    break
+        return True
 
     def tasks_due_on(self, day: date) -> list[CareTask]:
         """Tasks whose recurrence makes them relevant to `day`."""
@@ -440,6 +605,40 @@ class Owner:
         """Every task across every pet, flattened."""
         return [task for pet in self.pets for task in pet.tasks]
 
+    def find_tasks(
+        self,
+        pet_name: str | None = None,
+        completed: bool | None = None,
+    ) -> list[tuple[Pet, CareTask]]:
+        """Tasks matching the given filters, each paired with its pet.
+
+        Both filters are optional and both narrow: no arguments give the whole
+        household, `completed=False` gives everything still outstanding, and
+        the two together answer "what has Mochi got left to do". `None` means
+        "do not care", which is why `completed` is a tri-state rather than a
+        plain flag -- `False` and "unfiltered" are different questions.
+
+        Returns pairs rather than bare tasks for the same reason
+        `Scheduler._candidates` does: a CareTask cannot say whose it is, and
+        "Brush coat" is different work on a Ragdoll than on a Retriever.
+
+        `pet_name` is matched by `get_pet`, so it ignores case exactly like a
+        lookup does, and an unknown name gives nothing rather than everything
+        -- a filter that silently stops filtering is worse than an empty list.
+        """
+        wanted = None
+        if pet_name is not None:
+            wanted = self.get_pet(pet_name)
+            if wanted is None:
+                return []
+        return [
+            (pet, task)
+            for pet in self.pets
+            for task in pet.tasks
+            if (wanted is None or pet is wanted)
+            and (completed is None or task.completed is completed)
+        ]
+
 
 # ---------------------------------------------------------------------------
 # 4. Plan output
@@ -498,9 +697,15 @@ class ConflictWarning:
     whether 07:30 really belonged to the walk or to the medication, so the plan
     states the trade and leaves the judgement to them.
 
-    `first` kept the time; `second` lost it. Each is paired with its pet the way
-    ScheduledTask and SkippedTask are -- a bare pair of tasks could not say
-    whose they were, which is the first thing the owner needs to know.
+    Normally `first` kept the time and `second` lost it. When `both_displaced`
+    is set, neither kept it -- two tasks can both want 07:30 on a day that only
+    opens at 08:00 -- and naming either one the winner would simply be false.
+    The two are then ordered by where they actually landed, earliest first,
+    with a task that was never placed last, and `outcome` says so.
+
+    Each task is paired with its pet the way ScheduledTask and SkippedTask are:
+    a bare pair of tasks could not say whose they were, which is the first
+    thing the owner needs to know.
     """
 
     wanted: TimeWindow
@@ -510,6 +715,7 @@ class ConflictWarning:
     second_task: CareTask
     outcome: str = ""
     unresolvable: bool = False
+    both_displaced: bool = False
 
     def involves(self, pet: Pet) -> bool:
         """True if `pet` owns either side.
@@ -619,28 +825,96 @@ class DailyPlan:
         conflicts: list[ConflictWarning] = []
         for i, (pet_a, task_a, want_a) in enumerate(requested):
             for pet_b, task_b, want_b in requested[i + 1 :]:
-                if not want_a.overlaps(want_b):
-                    continue
-                # Whichever task actually holds the time it asked for is the
-                # winner. TimeWindow is frozen, so `==` compares by value.
-                holder = self._placement_of(task_a)
-                a_won = holder is not None and holder.slot == want_a
-                if a_won:
-                    winner, w_pet, loser, l_pet = task_a, pet_a, task_b, pet_b
-                else:
-                    winner, w_pet, loser, l_pet = task_b, pet_b, task_a, pet_a
-                conflicts.append(
-                    ConflictWarning(
-                        wanted=want_a if a_won else want_b,
-                        first_pet=w_pet,
-                        first_task=winner,
-                        second_pet=l_pet,
-                        second_task=loser,
-                        outcome=self._outcome_for(loser),
-                        unresolvable=winner.is_pinned() and loser.is_pinned(),
+                if want_a.overlaps(want_b):
+                    conflicts.append(
+                        self._warning_for(
+                            pet_a, task_a, want_a, pet_b, task_b, want_b
+                        )
                     )
-                )
         return conflicts
+
+    def _warning_for(
+        self,
+        pet_a: Pet,
+        task_a: CareTask,
+        want_a: TimeWindow,
+        pet_b: Pet,
+        task_b: CareTask,
+        want_b: TimeWindow,
+    ) -> ConflictWarning:
+        """Describe one clash: who kept the time, who lost it, what followed.
+
+        Whichever task actually holds the window it asked for is the winner.
+
+        Neither one holding it is a real outcome, not a fallback to be folded
+        into the second task losing: two tasks can both ask for 07:30 on a day
+        that opens at 08:00, and then the loser-shaped report is wrong in a way
+        the owner would act on -- it would name the task that got the *earlier*
+        slot as the one that had to move. That case gets its own shape.
+        """
+        if self._kept(task_a, want_a):
+            return self._won_by(pet_a, task_a, want_a, pet_b, task_b)
+        if self._kept(task_b, want_b):
+            return self._won_by(pet_b, task_b, want_b, pet_a, task_a)
+
+        ordered = sorted(
+            ((pet_a, task_a), (pet_b, task_b)),
+            key=lambda pair: self._start_of(pair[1]),
+        )
+        (first_pet, first_task), (second_pet, second_task) = ordered
+        return ConflictWarning(
+            wanted=min(want_a, want_b, key=lambda w: w.start),
+            first_pet=first_pet,
+            first_task=first_task,
+            second_pet=second_pet,
+            second_task=second_task,
+            outcome=(
+                f"neither kept it: {first_pet.name}'s {first_task.title} "
+                f"{self._outcome_for(first_task)}, "
+                f"{second_pet.name}'s {second_task.title} "
+                f"{self._outcome_for(second_task)}"
+            ),
+            unresolvable=first_task.is_pinned() and second_task.is_pinned(),
+            both_displaced=True,
+        )
+
+    def _won_by(
+        self,
+        w_pet: Pet,
+        winner: CareTask,
+        wanted: TimeWindow,
+        l_pet: Pet,
+        loser: CareTask,
+    ) -> ConflictWarning:
+        """A clash where `winner` is sitting in the window it asked for."""
+        return ConflictWarning(
+            wanted=wanted,
+            first_pet=w_pet,
+            first_task=winner,
+            second_pet=l_pet,
+            second_task=loser,
+            outcome=self._outcome_for(loser),
+            unresolvable=winner.is_pinned() and loser.is_pinned(),
+        )
+
+    def _kept(self, task: CareTask, wanted: TimeWindow) -> bool:
+        """True if `task` was placed in exactly the window it asked for.
+
+        TimeWindow is frozen, so `==` compares by value.
+        """
+        placed = self._placement_of(task)
+        return placed is not None and placed.slot == wanted
+
+    def _start_of(self, task: CareTask) -> int:
+        """Minutes into the day where `task` landed; a whole day if it did not.
+
+        The sort key for a clash neither task won: the one that ended up
+        earlier is reported first, and a task that was never placed sorts last.
+        """
+        placed = self._placement_of(task)
+        if placed is None:
+            return MINUTES_PER_DAY
+        return _to_minutes(placed.slot.start)
 
     def _requested_slots(self) -> list[tuple[Pet, CareTask, TimeWindow]]:
         """Every task in this plan that named a time, with the window it named.
@@ -814,8 +1088,12 @@ class Scheduler:
                     SkippedTask(
                         task,
                         pet,
-                        f"would exceed the {budget} min daily limit "
-                        f"({used} min already booked)",
+                        self._note_overdue(
+                            task,
+                            day,
+                            f"would exceed the {budget} min daily limit "
+                            f"({used} min already booked)",
+                        ),
                     )
                 )
                 continue
@@ -823,14 +1101,16 @@ class Scheduler:
             if slot is None:
                 skipped.append(
                     SkippedTask(
-                        task, pet, "no free slot left that meets its time limits"
+                        task,
+                        pet,
+                        self._note_overdue(task, day, self._no_slot_reason(task)),
                     )
                 )
                 continue
             taken.append(slot)
             used += task.duration_minutes
             scheduled.append(
-                ScheduledTask(task, pet, slot, self._reason_for(task, slot))
+                ScheduledTask(task, pet, slot, self._reason_for(task, slot, day))
             )
 
         plan = DailyPlan(
@@ -861,8 +1141,29 @@ class Scheduler:
         return sorted(items, key=lambda s: s.slot.start)
 
     def _candidates(self, owner: Owner, day: date) -> list[tuple[Pet, CareTask]]:
-        """Tasks due on `day` across all pets, each kept paired with its pet."""
-        return [(pet, task) for pet in owner.pets for task in pet.tasks_due_on(day)]
+        """Tasks due on `day` across all pets, each kept paired with its pet.
+
+        Refuses the same CareTask instance appearing under two pets. The plan
+        keys its task -> pet lookup by identity, so an aliased task would be
+        credited to whichever pet was added last and vanish from the other
+        pet's view of the day. The sharing itself is the bug, not just the
+        lookup: one instance carries one `completed` flag, so finishing the
+        task for one pet would silently finish it for both. Failing loudly
+        beats either quiet wrong answer.
+        """
+        pairs: list[tuple[Pet, CareTask]] = []
+        seen: dict[int, Pet] = {}
+        for pet in owner.pets:
+            for task in pet.tasks_due_on(day):
+                shared_with = seen.get(id(task))
+                if shared_with is not None:
+                    raise ValueError(
+                        f"task {task.title!r} is shared by {shared_with.name} "
+                        f"and {pet.name}; each pet needs its own CareTask"
+                    )
+                seen[id(task)] = pet
+                pairs.append((pet, task))
+        return pairs
 
     def _next_slot(self, task: CareTask, taken: list[TimeWindow]) -> TimeWindow | None:
         """Earliest window fitting `task` that clears `taken` and the owner's
@@ -894,14 +1195,52 @@ class Scheduler:
             return window
         return None
 
-    def _reason_for(self, task: CareTask, slot: TimeWindow) -> str:
+    def _reason_for(self, task: CareTask, slot: TimeWindow, day: date) -> str:
         """Build the explanation string stored on the resulting ScheduledTask."""
         bits = [f"{task.priority.value} priority"]
         if task.is_required:
             bits.append("required care")
+        if task.is_overdue_on(day):
+            bits.append(self._lateness(task, day))
         bits.append(
             f"earliest {task.duration_minutes} min opening at {slot.start:%H:%M}"
         )
         if task.latest_finish is not None:
             bits.append(f"must finish by {task.latest_finish:%H:%M}")
         return "; ".join(bits)
+
+    @staticmethod
+    def _lateness(task: CareTask, day: date) -> str:
+        """How late `task` is on `day`, phrased for the plan."""
+        late = task.days_overdue(day)
+        return (
+            f"overdue since {task.anchor_date:%Y-%m-%d} "
+            f"({late} day{'s' if late != 1 else ''} late)"
+        )
+
+    @staticmethod
+    def _no_slot_reason(task: CareTask) -> str:
+        """Why nothing fitted: a crowded day, or bounds no day could satisfy.
+
+        Both start with "no free slot" because both end the same way for the
+        owner -- the task is not on today's plan -- but only one of them can be
+        fixed by freeing up time.
+        """
+        if not task.has_impossible_bounds():
+            return "no free slot left that meets its time limits"
+        return (
+            f"no free slot left: its own limits "
+            f"({task.earliest_start:%H:%M}-{task.latest_finish:%H:%M}) cannot "
+            f"hold {task.duration_minutes} min"
+        )
+
+    def _note_overdue(self, task: CareTask, day: date, reason: str) -> str:
+        """Prefix a skip reason with how late `task` is, if it is late at all.
+
+        A task that was already overdue and then could not be fitted is the
+        worst case a plan can contain, and the bare skip reason does not say
+        so -- it reads the same as a task first seen today.
+        """
+        if not task.is_overdue_on(day):
+            return reason
+        return f"{self._lateness(task, day)}; {reason}"

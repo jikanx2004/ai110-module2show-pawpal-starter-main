@@ -174,11 +174,14 @@ def render_plan(owner: Owner, plan_day: date, strategy_name: str) -> None:
             if done:
                 successor = item.pet.complete_task(item.task.title, on=plan_day)
                 if successor is None:
-                    st.session_state.flash = f"{item.task.title}: done."
+                    st.session_state.flash = (
+                        f"{item.task.title}: done. Undo it under Pets and tasks."
+                    )
                 else:
                     st.session_state.flash = (
                         f"{item.task.title}: done. Next one due "
-                        f"{successor.anchor_date:%a %d %b}."
+                        f"{successor.anchor_date:%a %d %b}. "
+                        "Undo it under Pets and tasks."
                     )
                 st.rerun()
 
@@ -186,12 +189,24 @@ def render_plan(owner: Owner, plan_day: date, strategy_name: str) -> None:
 def task_status(task: CareTask, plan_day: date) -> str:
     """One-word state for a task relative to the day being planned.
 
-    Split out because the distinction that matters -- "done" versus "upcoming"
-    versus "not due" -- is exactly what makes recurrence rollover visible, and
-    burying it in an f-string inside a loop made it unreadable.
+    Split out because the distinction that matters -- "done" versus "overdue"
+    versus "upcoming" versus "not due" -- is exactly what makes recurrence
+    rollover visible, and burying it in an f-string inside a loop made it
+    unreadable.
+
+    Overdue is checked before due, because an overdue task is also due: it is
+    the more specific and the more urgent of the two, and reading only "due"
+    for a vet visit that was missed last week would hide the whole point of
+    tracking it.
     """
     if task.completed:
         return f"done {task.completed_on:%d %b}"
+    if task.is_overdue_on(plan_day):
+        late = task.days_overdue(plan_day)
+        return (
+            f"OVERDUE since {task.anchor_date:%a %d %b} "
+            f"({late} day{'s' if late != 1 else ''} late)"
+        )
     if task.is_due_on(plan_day):
         return "due"
     if task.anchor_date is not None and task.anchor_date > plan_day:
@@ -205,17 +220,43 @@ def render_tasks(owner: Owner, plan_day: date) -> None:
     A completed task stays in the list as the day's record and its successor
     appears beside it, due on a later date. Showing both is the clearest way to
     see that finishing a recurring task rescheduled it rather than deleting it.
+
+    Both buttons act on the row's own task object rather than on its title.
+    That matters here more than anywhere else in the app: the two rows a
+    rollover produces share a title, so asking the pet by title would act on
+    whichever one the logic layer preferred instead of the one clicked.
     """
     for pet in owner.pets:
         with st.expander(f"{pet.name} ({pet.species}) - {len(pet.tasks)} tasks"):
             if not pet.tasks:
                 st.caption("No tasks yet.")
-            for task in pet.tasks:
-                st.write(
+            for index, task in enumerate(pet.tasks):
+                cols = st.columns([6, 1, 1])
+                cols[0].write(
                     f"- {task.title} ({task.duration_minutes} min, "
                     f"{task.priority.value}, {task.recurrence.value}) - "
                     f"**{task_status(task, plan_day)}**"
                 )
+                # Keyed by position: a title is not unique within a pet once a
+                # task has rolled over, and Streamlit requires distinct keys.
+                if task.completed and cols[1].button(
+                    "Undo",
+                    key=f"undo-{pet.name}-{index}",
+                    help="Mark it not done again, and withdraw the next instance.",
+                    width="stretch",
+                ):
+                    pet.undo_completion(task)
+                    st.session_state.flash = f"{task.title}: marked not done again."
+                    st.rerun()
+                if cols[2].button(
+                    "Delete",
+                    key=f"delete-{pet.name}-{index}",
+                    help="Remove this one task from the pet.",
+                    width="stretch",
+                ):
+                    pet.remove_instance(task)
+                    st.session_state.flash = f"{task.title}: removed."
+                    st.rerun()
 
 
 def add_pet_form(owner: Owner) -> None:
