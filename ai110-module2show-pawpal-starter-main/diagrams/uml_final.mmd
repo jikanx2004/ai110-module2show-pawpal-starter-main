@@ -1,0 +1,258 @@
+classDiagram
+    %% ===================================================================
+    %% PawPal+ -- final UML class diagram
+    %%
+    %% Matches the shipped implementation in pawpal_system.py.
+    %%
+    %% Reading order: Owner/Pet describe *who* the plan is for, CareTask
+    %% describes *what* could happen, Scheduler turns those into a single
+    %% household DailyPlan whose entries each carry a reason.
+    %%
+    %% WHAT CHANGED SINCE diagrams/uml.mmd
+    %% The class list and every relationship survived the build unchanged --
+    %% no class was added, split or removed. What the first diagram could not
+    %% show was how much behavior each class would need in order to keep its
+    %% own promise, and every addition below is one of those:
+    %%
+    %%   1. CareTask gained is_overdue_on/days_overdue. The first diagram
+    %%      assumed is_due_on could be answered by Recurrence alone, but a
+    %%      ONCE task that was missed is due on no date at all, so it silently
+    %%      disappeared from every later plan. "Should the owner see this
+    %%      today" turned out to be a different question from "does this
+    %%      pattern fall on this day", and it belongs to the task, not the enum.
+    %%   2. CareTask gained __post_init__ and has_impossible_bounds, splitting
+    %%      bad input two ways: a duration of zero is refused on construction,
+    %%      while contradictory time bounds are reported in the plan. The UI
+    %%      can produce the second and not the first.
+    %%   3. Pet gained identity-based twins of its title-based methods
+    %%      (remove_instance, undo_completion). A rollover puts two rows under
+    %%      one title, so a title stopped being an identifier -- something the
+    %%      diagram's `remove_task(title)` arrow could not reveal.
+    %%   4. Owner gained find_tasks, returning (Pet, CareTask) pairs for the
+    %%      same reason Scheduler._candidates does: a CareTask cannot say
+    %%      whose it is.
+    %%   5. ConflictWarning gained both_displaced. "first kept the time,
+    %%      second lost it" assumed someone always wins; two tasks can both
+    %%      want 07:30 on a day that opens at 08:00.
+    %% ===================================================================
+
+    %% ---------- People & pets ----------
+
+    class Owner {
+        +str name
+        +List~Pet~ pets
+        +OwnerPreferences preferences
+        +add_pet(pet: Pet) void
+        +get_pet(name: str) Pet
+        +all_tasks() List~CareTask~
+        +find_tasks(pet_name: str, completed: bool) List~Pet_CareTask~
+    }
+
+    class OwnerPreferences {
+        +time day_start
+        +time day_end
+        +int max_daily_minutes
+        +List~TimeWindow~ busy_windows
+        +int break_minutes
+        +available_minutes() int
+        +is_free(window: TimeWindow) bool
+    }
+
+    class Pet {
+        +str name
+        +str species
+        +str breed
+        +float age_years
+        +int energy_level
+        +List~str~ notes
+        +List~CareTask~ tasks
+        +add_task(task: CareTask) void
+        +remove_task(title: str) bool
+        +remove_instance(task: CareTask) bool
+        +complete_task(title: str, on: date) CareTask
+        +reset_task(title: str) bool
+        +undo_completion(task: CareTask) bool
+        +tasks_due_on(day: date) List~CareTask~
+    }
+
+    %% ---------- Work to be scheduled ----------
+
+    class CareTask {
+        +str title
+        +int duration_minutes
+        +Priority priority
+        +TaskCategory category
+        +Recurrence recurrence
+        +time earliest_start
+        +time latest_finish
+        +bool is_required
+        +bool completed
+        +date anchor_date
+        +date completed_on
+        +__post_init__() void
+        +mark_complete(on: date) CareTask
+        +next_instance() CareTask
+        +reset() void
+        +weight() float
+        +fits_in(window: TimeWindow) bool
+        +wanted_window() TimeWindow
+        +is_pinned() bool
+        +has_impossible_bounds() bool
+        +is_overdue_on(day: date) bool
+        +days_overdue(day: date) int
+        +is_due_on(day: date) bool
+    }
+
+    class Priority {
+        <<enumeration>>
+        LOW
+        MEDIUM
+        HIGH
+        +score() int
+    }
+
+    class TaskCategory {
+        <<enumeration>>
+        FEEDING
+        EXERCISE
+        MEDICATION
+        GROOMING
+        ENRICHMENT
+        VET
+    }
+
+    class Recurrence {
+        <<enumeration>>
+        ONCE
+        DAILY
+        WEEKLY
+        +occurs_on(day: date, anchor: date) bool
+        +next_after(day: date) date
+    }
+
+    %% ---------- Time model ----------
+
+    class TimeWindow {
+        +time start
+        +time end
+        +duration_minutes() int
+        +overlaps(other: TimeWindow) bool
+        +contains(other: TimeWindow) bool
+        +shift(minutes: int) TimeWindow
+    }
+
+    %% ---------- Planning output ----------
+
+    class ScheduledTask {
+        +CareTask task
+        +Pet pet
+        +TimeWindow slot
+        +str reason
+        +label() str
+    }
+
+    class SkippedTask {
+        +CareTask task
+        +Pet pet
+        +str reason
+        +label() str
+    }
+
+    class ConflictWarning {
+        +TimeWindow wanted
+        +Pet first_pet
+        +CareTask first_task
+        +Pet second_pet
+        +CareTask second_task
+        +str outcome
+        +bool unresolvable
+        +bool both_displaced
+        +involves(pet: Pet) bool
+        +label() str
+    }
+
+    class DailyPlan {
+        +date day
+        +Owner owner
+        +List~ScheduledTask~ scheduled
+        +List~SkippedTask~ skipped
+        +List~ConflictWarning~ conflicts
+        +str strategy_name
+        +pets() List~Pet~
+        +for_pet(pet: Pet) DailyPlan
+        +total_minutes() int
+        +is_double_booked() bool
+        +detect_conflicts() List~ConflictWarning~
+        -_warning_for(pet_a, task_a, want_a, pet_b, task_b, want_b) ConflictWarning
+        -_won_by(w_pet, winner, wanted, l_pet, loser) ConflictWarning
+        -_kept(task: CareTask, wanted: TimeWindow) bool
+        -_start_of(task: CareTask) int
+        -_requested_slots() List~Pet_CareTask_TimeWindow~
+        -_placement_of(task: CareTask) ScheduledTask
+        -_outcome_for(task: CareTask) str
+        +explain() str
+        +to_rows() List~dict~
+    }
+
+    %% ---------- Planning engine ----------
+
+    class Scheduler {
+        +OwnerPreferences preferences
+        +SchedulingStrategy strategy
+        +build_plan(owner: Owner, day: date) DailyPlan
+        +sort_by_time(items: List~ScheduledTask~) List~ScheduledTask~
+        -_candidates(owner: Owner, day: date) List~Pet_CareTask~
+        -_next_slot(task: CareTask, taken: List~TimeWindow~) TimeWindow
+        -_reason_for(task: CareTask, slot: TimeWindow, day: date) str
+        -_lateness(task: CareTask, day: date) str
+        -_no_slot_reason(task: CareTask) str
+        -_note_overdue(task: CareTask, day: date, reason: str) str
+    }
+
+    class SchedulingStrategy {
+        <<abstract>>
+        +str name
+        +order(tasks: List~CareTask~) List~CareTask~
+        +describe() str
+    }
+
+    class PriorityFirstStrategy {
+        +order(tasks: List~CareTask~) List~CareTask~
+        +describe() str
+    }
+
+    class QuickWinsStrategy {
+        +order(tasks: List~CareTask~) List~CareTask~
+        +describe() str
+    }
+
+    %% ---------- Relationships ----------
+
+    Owner "1" *-- "1" OwnerPreferences : configured by
+    Owner "1" *-- "0..*" Pet : cares for
+    Pet "1" *-- "0..*" CareTask : needs
+
+    CareTask --> Priority : ranked by
+    CareTask --> TaskCategory : typed as
+    CareTask --> Recurrence : repeats per
+
+    Scheduler "1" --> "1" OwnerPreferences : constrained by
+    Scheduler "1" o-- "1" SchedulingStrategy : ordered by
+    SchedulingStrategy <|-- PriorityFirstStrategy
+    SchedulingStrategy <|-- QuickWinsStrategy
+
+    Scheduler ..> Owner : reads
+    Scheduler ..> DailyPlan : creates
+    DailyPlan "1" --> "1" Owner : plans for
+    DailyPlan "1" *-- "0..*" ScheduledTask : contains
+    DailyPlan "1" *-- "0..*" SkippedTask : could not fit
+    DailyPlan "1" *-- "0..*" ConflictWarning : warns about
+    ScheduledTask "1" --> "1" CareTask : wraps
+    ScheduledTask "1" --> "1" Pet : belongs to
+    ScheduledTask "1" *-- "1" TimeWindow : occupies
+    SkippedTask "1" --> "1" CareTask : wraps
+    SkippedTask "1" --> "1" Pet : belongs to
+    ConflictWarning "1" --> "2" CareTask : compares
+    ConflictWarning "1" --> "2" Pet : belongs to
+    ConflictWarning "1" *-- "1" TimeWindow : contests
+    OwnerPreferences "1" *-- "0..*" TimeWindow : blocks

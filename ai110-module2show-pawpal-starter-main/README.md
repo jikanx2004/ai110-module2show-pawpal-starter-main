@@ -123,23 +123,60 @@ Marking today's recurring tasks complete:
   (completed tasks are gone; their successors are not due yet)
 ```
 
+Finally the demo adds three tasks in deliberately scrambled order and prints
+them back sorted and filtered, so both operations are visible without the UI:
+
+```
+Adding three tasks to Biscuit, deliberately out of order:
+  entered: Bedtime brush (wants 19:30)
+  entered: Sunrise sniff (wants 07:15)
+  entered: Evening treat (wants 18:30)
+
+  The plan comes back in clock order, not entry order:
+    07:00  Biscuit: Breakfast
+    07:15  Biscuit: Sunrise sniff
+    07:30  Mochi: Ear medication
+    07:35  Mochi: Playtime
+    17:30  Biscuit: Evening hike
+    18:30  Biscuit: Evening treat
+    19:30  Biscuit: Bedtime brush
+
+  sort_by_time() on a reversed copy of that list:
+    before: 19:30, 18:30, 17:30, 07:35, 07:30, 07:15, 07:00
+    after:  07:00, 07:15, 07:30, 07:35, 17:30, 18:30, 19:30
+    input untouched: 19:30 still first
+
+--------------------------------------------------------------
+Filtering the household with find_tasks():
+  everything: 11
+  Mochi only (name typed in lower case): 4
+  still to do: 9
+  already done: 2 -> Biscuit/Morning walk, Mochi/Brush coat
+  Biscuit, still to do: 6
+  a pet who does not exist: 0 -> (none)
+```
+
 ## 🧪 Testing PawPal+
 
 ```bash
 # Run the full test suite:
-pytest
+python -m pytest
+
+# Quieter, one character per test:
+python -m pytest -q
 
 # Run with coverage:
-pytest --cov
+python -m pytest --cov
 ```
 
 Sample test output:
 
 ```
-$ pytest -q
-........................................................................ [ 54%]
-...........................................................              [100%]
-131 passed in 0.21s
+$ python -m pytest -q
+........................................................................ [ 34%]
+........................................................................ [ 69%]
+................................................................         [100%]
+208 passed in 0.17s
 ```
 
 Tests live in `tests/`. `test_pawpal.py` covers the two fundamentals — marking
@@ -165,13 +202,63 @@ actually ruin someone's day if they broke:
   warns about two tasks wanting 09:00 and asserts `is_double_booked()` is still
   False, so the two checks can never be quietly collapsed into one.
 
+The three behaviors the brief calls for are each covered directly:
+
+| Required behavior | Where |
+|---|---|
+| **Sorting correctness** — tasks returned in chronological order | `TestSortByTime` (a reversed list comes back ordered, the input is not mutated, minutes inside an hour sort correctly) and `TestScheduler::test_output_is_sorted_by_time` |
+| **Recurrence logic** — completing a daily task creates tomorrow's | `TestCareTask::test_completing_a_daily_task_yields_tomorrows_instance`, `TestPet::test_complete_task_files_the_successor`, and `TestRecurringTaskLifecycle::test_ten_days_of_rollover_stay_exactly_one_task_a_day` |
+| **Conflict detection** — duplicate times are flagged | `TestConflictDetection` (11 tests) and `TestConflictAttribution` (6 tests) |
+
+A later pass added edge-case coverage, most of it written as regression tests
+against defects the first suite had missed. Their docstrings say what the old
+behavior was:
+
+- **Invalid input** (`TestTaskValidation`) — a zero or negative duration used to
+  crash `build_plan` from deep inside `TimeWindow`; it is now refused where it
+  is written. Contradictory time bounds are deliberately *not* refused, because
+  the UI can produce them and the plan should explain them instead.
+- **Missed work** (`TestOverdueTasks`) — a one-off task that came due and was
+  never done used to vanish from every later plan. It now surfaces as overdue,
+  and the tests pin down that this did *not* break rollover: a completed daily
+  task's successor is still kept out of today.
+- **The recurring lifecycle** (`TestRecurringTaskLifecycle`) — removing and
+  resetting a rolled-over task, completing one retroactively or ahead of time,
+  and ten consecutive days of rollover with exactly one task due per day.
+- **Ordering** (`TestOrderingEdgeCases`) — the sort is total (a long important
+  task cannot sink below a short trivial one), stable, and deterministic across
+  runs.
+- **Identity, not titles** (`TestIdentityBasedEditing`) — after one rollover two
+  rows share a title, so deleting or undoing the row a user clicked has to act
+  on that object, not on the name.
+- **Filtering** (`TestFindTasks`) — including the case that surprises people: a
+  rolled-over task appears in both the `completed=True` and `completed=False`
+  results, because the record and its successor are two different objects.
+
+**Confidence level: ⭐⭐⭐⭐☆ (4 / 5)**
+
+Four rather than five, on the evidence rather than on feel. In its favour: 208
+tests pass in well under a second, the scheduler's core invariant
+(`is_double_booked()` is never True) is asserted across every edge case the
+suite builds, and the edge-case pass found and fixed five real defects — which
+is itself the reason for the missing star, since a suite that had felt thorough
+at 131 tests was still hiding those. What is not covered: no property-based or
+randomised testing, so the guarantees hold only for the cases someone thought
+to write; no persistence layer exists, so nothing is tested across restarts;
+and the Streamlit UI is verified by driving it headlessly rather than by any
+committed test, since the app's own behavior is not part of the suite.
+
 ## 📐 Smarter Scheduling
 
 | Feature | Method(s) | Notes |
 |---------|-----------|-------|
 | Sorting — ordering | `CareTask.weight()`, `PriorityFirstStrategy.order()`, `QuickWinsStrategy.order()` | Which tasks are *tried* first. Ordering is a swappable strategy, not baked into the scheduler. `weight()` bands are spaced so required care outranks priority, and priority outranks brevity. |
 | Sorting — output | `Scheduler.sort_by_time()` | Which order the owner *reads* them in. Placement order is deliberately not clock order, so the finished list is sorted once on the way out with `sorted(items, key=lambda s: s.slot.start)`. Stable, so same-minute tasks keep their placement order. |
-| Filtering | `Pet.tasks_due_on()`, `CareTask.is_due_on()`, `Scheduler._candidates()` | Completed and not-yet-due tasks drop out before scheduling starts. `DailyPlan.for_pet()` filters the finished plan down to one animal. |
+| Filtering — for the plan | `Pet.tasks_due_on()`, `CareTask.is_due_on()`, `Scheduler._candidates()` | Completed and not-yet-due tasks drop out before scheduling starts. `DailyPlan.for_pet()` filters the finished plan down to one animal. |
+| Filtering — for the owner | `Owner.find_tasks(pet_name, completed)` | Ad-hoc queries over the whole household: by pet (case-insensitive, via `get_pet`), by completion, or both. `completed` is tri-state — `None` means "do not care", which is a different question from `False`. Returns `(Pet, CareTask)` pairs, because a task cannot say whose it is. |
+| Missed work | `CareTask.is_overdue_on()`, `CareTask.days_overdue()` | A `ONCE` or `WEEKLY` task that came due and was never completed keeps appearing until it is done. Looks strictly backwards, which is what stops it colliding with rollover: a successor is always anchored forwards, so it can never read as overdue today. `DAILY` is excluded — it is already due every day, and missed days should not become a backlog. |
+| Bad input | `CareTask.__post_init__()`, `CareTask.has_impossible_bounds()` | Split two ways on purpose. A non-positive or longer-than-a-day duration is refused on construction. Contradictory time bounds (due after 18:00, finish by 09:00) are *not* refused — the UI collects those as two independent inputs, so the plan explains them instead of the app crashing. |
+| Editing one row | `Pet.remove_instance()`, `Pet.undo_completion()` | Identity-based twins of the title-based `remove_task` / `reset_task`. After a rollover two rows share a title, so the UI's Delete and Undo buttons act on the task object in that row rather than on its name. |
 | Double-booking (prevented) | `TimeWindow.overlaps()`, `Scheduler._next_slot()`, `DailyPlan.is_double_booked()` | All overlap logic lives in `TimeWindow`. One shared `taken` list spans the household, so two pets can never get the same slot. `is_double_booked()` is an invariant check — True would mean a bug. |
 | Time conflicts (reported) | `CareTask.wanted_window()`, `CareTask.is_pinned()`, `DailyPlan.detect_conflicts()`, `ConflictWarning.label()` | A different question: did two tasks *ask for* the same time? Returned as data, never raised — the plan it describes is already valid. `is_pinned()` marks a clash no scheduler could resolve, because neither task has any slack. |
 | Recurring tasks | `Recurrence.occurs_on()`, `Recurrence.next_after()`, `CareTask.mark_complete()`, `CareTask.next_instance()`, `Pet.complete_task()` | `DAILY` always fires; `WEEKLY` matches the anchor's weekday; `ONCE` matches the exact date. Completing a recurring task spawns its successor via `timedelta` and files it beside the original, so the owner never re-enters a repeating task. |
@@ -193,12 +280,102 @@ time field meaning almost the same thing as an existing one. See
 
 ## 📸 Demo Walkthrough
 
-Describe your app in numbered steps so a reader can follow along without watching a video:
+### What the interface gives you
 
-1. <!-- Describe this step -->
-2. <!-- Describe this step -->
-3. <!-- Describe this step -->
-4. <!-- Describe this step -->
-5. <!-- Add more steps as needed -->
+`streamlit run app.py` opens a single page in three bands:
+
+- **Sidebar — the owner's constraints.** Waking hours, a daily care budget, the
+  break between tasks, busy windows (work, commute), which day to plan, and
+  which ordering strategy to use. Changing any of them re-plans immediately, so
+  the sidebar doubles as a way to interrogate the scheduler: shrink the budget
+  and watch which tasks it protects.
+- **Schedule — the plan.** Four metrics across the top (tasks scheduled, minutes
+  booked, minutes actually usable, conflicts found), then the plan as a sorted
+  table, then conflict warnings, then anything that could not fit and why, then
+  an expandable **Why this plan** panel holding `DailyPlan.explain()` verbatim.
+  Every scheduled task carries a **Done** button.
+- **Pets and tasks — the household.** One expander per pet, listing every task
+  with its state (`due`, `OVERDUE since Fri 18 Sep (9 days late)`,
+  `done 27 Sep`, `upcoming Mon 28 Sep`). Each row has **Delete**, and completed
+  rows also have **Undo**. Below that, forms to add a pet or a task.
+
+### An example workflow
+
+1. **Open the app.** It starts from the demo household — Biscuit the retriever
+   and Mochi the cat — so there is a real plan on screen before you type
+   anything.
+2. **Add a pet.** *Pets and tasks* → **Add pet** → name, species, age.
+3. **Give it a task.** **Add task** → choose the pet, a title, minutes,
+   priority, category and how it repeats. Optionally tick *Not before* or
+   *Must finish by* to give it hard bounds.
+4. **Read the schedule.** The table at the top is in clock order no matter what
+   order you entered tasks in.
+5. **Provoke a conflict.** Give two pets a task that both start at the same
+   time. Neither is dropped: the plan gives the slot to one and reports the
+   trade as a warning, naming both tasks and saying where the other one went.
+6. **Mark something done.** Click **Done** on a scheduled task. If it recurs,
+   the confirmation tells you when the next one is due — you never re-enter a
+   repeating task.
+7. **Change your mind.** That task now shows as done in *Pets and tasks*, with
+   an **Undo** button that clears the completion *and* withdraws the successor
+   it booked, so the day does not end up holding two copies.
+
+### What the Scheduler is doing behind that
+
+- **Two different sorts.** `SchedulingStrategy.order()` decides which tasks are
+  *tried* first (importance, or brevity); `Scheduler.sort_by_time()` decides the
+  order you *read* them in. They are deliberately not the same: a high-priority
+  evening task is placed before a low-priority morning one, then the finished
+  list is sorted into a timeline on the way out.
+- **Conflict warnings, not conflict errors.** Two tasks asking for one time is
+  information, not a failure — the plan it describes is already valid. Ordinary
+  clashes render as `st.warning`; a clash neither task could win (both pinned to
+  the same slot with no slack) renders as `st.error`, because no scheduler can
+  fix that one and only the owner can.
+- **Recurrence that books itself.** Completing a daily or weekly task files its
+  next instance automatically, anchored to the day the work actually happened.
+- **Filtering.** Completed and not-yet-due tasks drop out before scheduling
+  starts, and `Owner.find_tasks()` answers ad-hoc questions like "what has Mochi
+  still got left to do".
+- **One shared timeline.** A single `taken` list and one minute budget span the
+  whole household, because one owner cannot walk two dogs at once.
+
+### Sample CLI output
+
+The same logic without Streamlit — `python main.py`, final section:
+
+```
+--------------------------------------------------------------
+Adding three tasks to Biscuit, deliberately out of order:
+  entered: Bedtime brush (wants 19:30)
+  entered: Sunrise sniff (wants 07:15)
+  entered: Evening treat (wants 18:30)
+
+  The plan comes back in clock order, not entry order:
+    07:00  Biscuit: Breakfast
+    07:15  Biscuit: Sunrise sniff
+    07:30  Mochi: Ear medication
+    07:35  Mochi: Playtime
+    17:30  Biscuit: Evening hike
+    18:30  Biscuit: Evening treat
+    19:30  Biscuit: Bedtime brush
+
+  sort_by_time() on a reversed copy of that list:
+    before: 19:30, 18:30, 17:30, 07:35, 07:30, 07:15, 07:00
+    after:  07:00, 07:15, 07:30, 07:35, 17:30, 18:30, 19:30
+    input untouched: 19:30 still first
+
+--------------------------------------------------------------
+Filtering the household with find_tasks():
+  everything: 11 -> Biscuit/Morning walk, Biscuit/Breakfast, ...
+  Mochi only (name typed in lower case): 4 -> Mochi/Ear medication, ...
+  still to do: 9 -> Biscuit/Breakfast, Biscuit/Evening hike, ...
+  already done: 2 -> Biscuit/Morning walk, Mochi/Brush coat
+  Biscuit, still to do: 6 -> Biscuit/Breakfast, Biscuit/Evening hike, ...
+  a pet who does not exist: 0 -> (none)
+```
+
+The full run — today's schedule, the two strategies compared, and the
+recurrence rollover — is in [Sample Output](#️-sample-output) above.
 
 **Screenshot or video** *(optional)*: <!-- Insert a screenshot or link to a demo video here -->
